@@ -1,11 +1,13 @@
 // POST /api/cloud-save — lưu bản save lên mây, nhận mã 6 ký tự.
+//   TỰ CHỨA HOÀN TOÀN: chỉ dùng bảng cloud_saves, KHÔNG đụng bảng leaderboard.
 //   Mỗi người chơi giữ đúng 1 bản trên mây; lưu lại thì ghi đè + cấp mã mới
 //   (mã cũ hết hiệu lực). Bản lưu giữ vĩnh viễn cho tới khi bị ghi đè.
+//   Secret lưu ngay trong cloud_saves (cột secret), không cần bảng ngoài.
 //   Idempotent: client gửi kèm attemptId (UUID mỗi lần bấm Lưu); nếu client bị
 //   timeout nhưng server đã ghi xong, client thử lại với cùng attemptId sẽ nhận
 //   lại kết quả cũ (kèm secret) thay vì 403 — không bao giờ kẹt deadlock.
 // GET /api/cloud-save?code=XXXXXX — khôi phục bản save bằng mã (kèm playerId + secret
-//   để trình duyệt mới giữ đúng danh tính BXH).
+//   để trình duyệt mới giữ đúng danh tính).
 //
 // LƯU Ý: cloud-save dùng project Supabase RIÊNG, tách khỏi BXH/tên
 // (score.js và leaderboard.js vẫn dùng SUPABASE_URL / SUPABASE_SERVICE_KEY cũ).
@@ -60,7 +62,8 @@ export default async function handler(req, res) {
   // ---------------- LƯU: POST ----------------
   if (req.method === 'POST') {
     if (throttled(ip, 'save')) return res.status(429).json({ ok: false, error: 'slow down' });
-    const { playerId, secret, saveData, saveAt, force } = req.body || {};
+    const { playerId, secret, saveData, saveAt, force, attemptId: attemptIdRaw } = req.body || {};
+    const attemptId = (typeof attemptIdRaw === 'string') ? attemptIdRaw.slice(0, 64) : '';
 
     if (!playerId || typeof playerId !== 'string' || playerId.length > 64) {
       return res.status(400).json({ ok: false, error: 'bad id' });
@@ -87,74 +90,47 @@ export default async function handler(req, res) {
       }
     }
 
-    // Idempotent retry: client bị timeout/rớt mạng nhưng server có thể đã ghi xong
-    // ở attempt trước → trả lại kết quả cũ (kèm secret) thay vì 403, để client
-    // không bao giờ kẹt ở trạng thái "server đã ghi mà client không biết secret".
+    // Idempotent retry: nếu attemptId này đã được xử lý rồi (client bị timeout
+    // nhưng server đã ghi xong), trả lại kết quả cũ kèm secret thay vì 403.
     // attemptId là UUID ngẫu nhiên do client tạo mỗi lần bấm Lưu, không đoán được.
-    const attemptId = (req.body && typeof req.body.attemptId === 'string') ? req.body.attemptId.slice(0, 64) : '';
     if (attemptId) {
       const { data: retryRow } = await supabase
         .from('cloud_saves')
-        .select('save_code')
+        .select('save_code, secret')
         .eq('player_id', playerId)
         .eq('last_attempt_id', attemptId)
         .maybeSingle();
       if (retryRow) {
-        const { data: lbRow } = await supabase
-          .from('leaderboard')
-          .select('secret')
-          .eq('player_id', playerId)
-          .maybeSingle();
-        return res.status(200).json({ ok: true, code: retryRow.save_code, secret: (lbRow && lbRow.secret) || null });
+        return res.status(200).json({ ok: true, code: retryRow.save_code, secret: retryRow.secret || null });
       }
     }
 
-    // Xác thực: secret phải trùng mã của player trong bảng leaderboard.
-    // Chưa có hàng (chơi ngày 1 chưa gửi điểm lần nào): tạo hàng + cấp secret luôn.
-    const { data: old } = await supabase
-      .from('leaderboard')
-      .select('secret')
+    // Lấy bản hiện tại (nếu có) để kiểm tra secret + chống ghi đè bản mới hơn.
+    const { data: existing } = await supabase
+      .from('cloud_saves')
+      .select('save_code, secret, updated_at')
       .eq('player_id', playerId)
       .maybeSingle();
 
+    // Xác thực: secret phải trùng với secret của bản đã lưu (nếu có).
+    // Chưa có bản lưu: tạo secret mới cho người chơi này.
+    // Bản cũ chưa có secret (dữ liệu trước khi thêm cột): cấp cho người đầu tiên.
     let token = secret;
-    if (!old) {
-      token = crypto.randomUUID();
-      const { error } = await supabase.from('leaderboard').insert({
-        player_id: playerId,
-        secret: token,
-        studio_name: 'Tiệm ảnh',
-        owner_name: 'Chủ tiệm',
-        level: 1,
-        revenue: 0,
-        rating: 0,
-        updated_at: new Date().toISOString(),
-      });
-      if (error) {
-      // Kho đầy: báo cho game hiện "Cloud quá tải"
-      if (/disk full/i.test(error.message || '')) {
-        return res.status(507).json({ ok: false, error: 'storage_full' });
-      }
-      return res.status(500).json({ ok: false });
-    }
-    } else if (old.secret) {
-      if (!token || token !== old.secret) {
+    if (existing) {
+      if (!existing.secret) {
+        token = crypto.randomUUID();
+      } else if (!token || token !== existing.secret) {
         return res.status(403).json({ ok: false, error: 'not yours' });
+      } else {
+        token = existing.secret;
       }
     } else {
-      // Hàng cũ chưa có secret: cấp cho người đầu tiên gửi đúng playerId
       token = crypto.randomUUID();
-      await supabase.from('leaderboard').update({ secret: token }).eq('player_id', playerId);
     }
 
     // Chống ghi đè bản mây MỚI HƠN bằng bản cũ hơn: nếu trên mây đã có bản lưu
     // mới hơn bản đang up lên (so theo thời điểm lưu, trừ hao 60s lệch đồng hồ)
     // thì từ chối để game hỏi người chơi có chắc ghi đè không (force:true để ép).
-    const { data: existing } = await supabase
-      .from('cloud_saves')
-      .select('save_code, updated_at')
-      .eq('player_id', playerId)
-      .maybeSingle();
     if (existing && !force) {
       const incomingAt = Number(saveAt);
       if (
@@ -185,6 +161,7 @@ export default async function handler(req, res) {
         player_id: playerId,
         save_code: code,
         save_data: saveData,
+        secret: token,
         updated_at: new Date().toISOString(),
         last_attempt_id: attemptId || null,
       },
@@ -210,23 +187,18 @@ export default async function handler(req, res) {
     }
     const { data } = await supabase
       .from('cloud_saves')
-      .select('player_id, save_data, updated_at')
+      .select('player_id, save_data, secret, updated_at')
       .eq('save_code', code)
       .maybeSingle();
     if (!data) return res.status(404).json({ ok: false, error: 'not found' });
-    // Trả kèm playerId + secret để trình duyệt mới giữ đúng 1 danh tính BXH
+    // Trả kèm playerId + secret để trình duyệt mới giữ đúng danh tính
     // (người có mã chính là chủ bản lưu nên được phép nhận lại secret của mình)
-    const { data: lb } = await supabase
-      .from('leaderboard')
-      .select('secret')
-      .eq('player_id', data.player_id)
-      .maybeSingle();
     return res.status(200).json({
       ok: true,
       saveData: data.save_data,
       updatedAt: data.updated_at,
       playerId: data.player_id,
-      secret: (lb && lb.secret) || null,
+      secret: data.secret || null,
     });
   }
 
